@@ -1040,7 +1040,10 @@ end
         kids = string(cnnLayers.Connections.Destination(mask));
         newKids = setdiff(kids, [desc; string(layerName)]);
         desc    = unique([desc; kids], 'stable');
-        toVisit = unique([toVisit; newKids], 'stable');
+        %ajout de ma part pour la concaténation 
+        toVisit = unique([toVisit(:); newKids(:)], 'stable');
+
+        %toVisit = unique([toVisit; newKids], 'stable');
     end
     desc = setdiff(desc, layerName);
     desc = intersect(desc, names);
