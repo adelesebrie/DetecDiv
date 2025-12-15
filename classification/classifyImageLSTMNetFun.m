@@ -82,7 +82,6 @@ end
 
 % --------- Trouver frames & canal ---------
 
-
 pix = roiobj.findChannelID(channel);
 if iscell(pix); pix = cell2mat(pix); end
 if isempty(frames); frames = 1:size(roiobj.image,4); end
@@ -107,9 +106,7 @@ if Crop
     vid = cropAroundCenter4D(vid, CropCenter, CropSize);
 end
 
-
 %figure('Position',[100 100 400 400]), imshow(vid(:,:,:,100),[])
-
 
 % --------- Déduire tailles d'entrée ---------
 % LSTM: cherche SequenceInputLayer

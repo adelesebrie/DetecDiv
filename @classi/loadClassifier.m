@@ -217,7 +217,9 @@ while ~isempty(toVisit)
     kids = string(lgraphCNN.Connections.Destination(mask));
     newKids = setdiff(kids, [desc; string(layerName)]);
     desc    = unique([desc; kids], 'stable');
-    toVisit = unique([toVisit; newKids], 'stable');
+    %mon ajout pour problème de concaténation:
+    toVisit = unique([toVisit(:); newKids(:)], 'stable');
+    %toVisit = unique([toVisit; newKids], 'stable');
 end
 desc = setdiff(desc, layerName);
 desc = intersect(desc, names);
