@@ -28,6 +28,25 @@ if nargin>=4
 end
 
 h=findobj('Tag',['Fov' obj.id]);
+fprintf('[view] opening FOV=%s frame=%d selectedChannels=%s\n', ...
+    localFovLabel(obj), frame, mat2str(find(obj.display.selectedchannel==1)));
+
+% Ensure raw data is reachable once per view call.
+selCh = find(obj.display.selectedchannel==1, 1, 'first');
+if isempty(selCh), selCh = 1; end
+try
+    % Non-blocking in view: avoid modal dialogs / long recursive scans.
+    [obj, okRaw] = detecdiv_paths_ensure_fov_ready(obj, selCh, false, false);
+    if ~okRaw
+        fprintf('[view] rawdata unavailable for FOV=%s selectedChannel=%d\n', localFovLabel(obj), selCh);
+        warning(['Raw data not accessible for FOV %s (channel %d). ' ...
+            'Relink paths first, then reopen view.'], obj.id, selCh);
+        return;
+    end
+catch ME
+    warning('Unable to access rawdata for FOV %s: %s', obj.id, ME.message);
+    return;
+end
 
 if numel(h) && numel(h.Children) && rebuild==0% handle exists already
  
@@ -106,6 +125,8 @@ if ishandle(hp)
 else
 return;
 end
+
+fprintf('[view] viewer ready for FOV=%s frame=%d\n', localFovLabel(obj), obj.display.frame);
 
     
     % create display menu
@@ -1071,7 +1092,13 @@ dlgtitle = 'Input movie export parameters';
 dims = [1 100];
 
 fra=obj.frames(1);
-pth=fullfile(obj.srcpath{1},'mymovie');
+try
+    [obj, ok] = detecdiv_paths_ensure_fov_ready(obj, 1);
+    if ~ok, return; end
+catch
+end
+pth = fullfile(obj.srcpath{1}, 'mymovie');
+
 definput = {['1:' num2str(fra)],pth,'10','10','20','0','0'};%, num2str(inte)};
 answer = inputdlg(prompt,dlgtitle,dims,definput);
 
@@ -1148,6 +1175,19 @@ obj.export(arg{:});
 
 
 
+end
+
+function label = localFovLabel(obj)
+label = '';
+try
+    if isprop(obj,'id') && ~isempty(obj.id)
+        label = char(string(obj.id));
+    end
+catch
+end
+if isempty(label)
+    label = '<unnamed>';
+end
 end
 
 

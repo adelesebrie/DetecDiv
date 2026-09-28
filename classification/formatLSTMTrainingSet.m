@@ -24,6 +24,14 @@ StorageBackend      = 'hdf5';% 'hdf5' ou 'tiff'
 UseHDF5             = true;  % dérivé de StorageBackend
 WriteTiffImages= ~UseHDF5; 
 
+HDF5BatchSize = 64;           % nb de frames CNN écrites d'un coup
+H0_global     = [];
+W0_global     = [];
+frameBuffer   = [];
+labelBuffer   = [];
+bufCount      = 0;
+
+
 % -------------------------------------------------------------------------
 % 1) Lire les paramètres de formatage dans classif.trainingParam (Format_*)
 % -------------------------------------------------------------------------
@@ -44,6 +52,24 @@ if isprop(classif,'trainingParam') && ~isempty(classif.trainingParam)
             StorageBackend = StorageBackend{end};
         end
     end
+
+    L = [];
+if isfield(tp,'LSTM_sequence_length')
+    L = tp.LSTM_sequence_length;
+    if iscell(L), L = L{end}; end
+end
+
+% >>> AJOUT: 0 => pas de découpage, on prend toute la séquence
+if isempty(L) || ~isscalar(L)
+    L = 30; % fallback
+end
+L = round(L);
+if L == 0
+    L = Inf; % une seule fenêtre = toute la ROI
+end
+if L < 0
+    L = 30; % sécurité
+end
 end
 
 % Dériver UseHDF5 à partir du backend
@@ -114,18 +140,25 @@ if ~UseHDF5 && ~isfolder(fullfile(classif.path, foldername, 'timeseries'))
 end
 
 % ---- Préparation HDF5 (framebank CNN) ----
-h5Framebank = fullfile(classif.path, [classif.strid, '_framebank.h5']);
-if UseHDF5 && exist(h5Framebank,"file")
-    delete(h5Framebank);
-
-    % removing trainingdataset folder in case of hdf5
-     if isfolder(fullfile(classif.path, foldername))
-            try
-                rmdir(fullfile(classif.path, foldername), 's');
-            catch
-                disp('Error: did not manage to remove directory!');
-            end
-     end
+h5FramebankBase = fullfile(classif.path, [classif.strid, '_framebank.h5']);   % %%% <<<
+if UseHDF5
+    % Choix robuste du chemin : si le fichier existe et ne peut pas être
+    % supprimé, on bascule vers _framebank_001.h5, _002, etc.              %%% <<<
+    h5Framebank = chooseFramebankPath(h5FramebankBase);                    %%% <<<
+    %[h5Framebank, info] = findExistingFramebank(h5FramebankBase);
+    
+    % removing trainingdataset folder in cas de HDF5 (comme avant)         %%% <<<
+    if isfolder(fullfile(classif.path, foldername))
+        try
+            rmdir(fullfile(classif.path, foldername), 's');
+        catch
+            disp('Error: did not manage to remove directory!');
+        end
+    end
+else
+    % Backend TIFF : on garde le nom "de base" (normalement jamais utilisé
+    % dans la suite si UseHDF5=false, mais on le définit par sécurité).     %%% <<<
+    h5Framebank = h5FramebankBase;                                         %%% <<<
 end
 
 h5Initialized = false;
@@ -139,6 +172,23 @@ cltmp = classif.roi;
 warning off all
 
 channel = classif.channelName;
+[boundsMode, boundsGlobal] = localGetBoundsPolicy(classif);
+
+switch lower(string(boundsMode))
+    case "auto"
+        if isempty(boundsGlobal)
+            disp('[BOUNDS][START] Mode=Auto. No global min:max specified -> all selected frames are considered.');
+        else
+            disp(sprintf('[BOUNDS][START] Mode=Auto. Global min:max active: [%d %d]. Frames outside these bounds are ignored.', ...
+                boundsGlobal(1), boundsGlobal(2)));
+        end
+    case "manual"
+        disp('[BOUNDS][START] Mode=Manual. ROI-specific bounds (userbounds/bounds) are used when available.');
+    case "rules"
+        disp('[BOUNDS][START] Mode=Rules. Rule-based ROI bounds are used when available.');
+    otherwise
+        disp(sprintf('[BOUNDS][START] Mode=%s. ROI bounds are used when available.', string(boundsMode)));
+end
 
 % ---- Sélection déterministe d'une fraction de ROIs ----
 n_all = numel(rois);
@@ -168,9 +218,6 @@ majorityClassesGlobal = [];
 
 % =====================================================
 %  PRE-PASS GLOBAL POUR UNDERSAMPLING CNN (OPTIONNEL)
-%  - On ne le fait que si UndersampleMajority < 1
-%    ET qu'on génère un dataset CNN (TIFF ou HDF5).
-%  - Ne touche PAS aux timeseries LSTM.
 % =====================================================
 
 fprintf('Preprocessing ROIs to evaluate class imbalance \n')
@@ -205,24 +252,8 @@ if UndersampleMajority < 1 && (UseHDF5 || WriteTiffImages) && strcmp(category,'L
             continue;
         end
 
-        % Bounds depuis userData
-        bounds = [];
-        ud = [];
-        try
-            ud = roiSeriesSel(1).userData;
-        catch
-            ud = [];
-        end
-        if isstruct(ud) && isfield(ud,'bounds')
-            bounds = ud.bounds;
-        elseif isa(ud,'containers.Map') && isKey(ud,'bounds')
-            bounds = ud('bounds');
-        end
-        if ~isempty(bounds)
-            if numel(bounds)==1 || bounds(1)==0
-                bounds = [];
-            end
-        end
+        % Bounds selon mode classif.bounds.Type (Auto / Manual / Rules)
+        bounds = resolveROIFrameBounds(roiSeriesSel, classif);
 
         % Labels bruts
         rawLabels = roiSeriesSel.getData('labels_training');
@@ -294,7 +325,7 @@ else
 end
 
 % --- AJOUT : affichage du paramètre d'undersampling choisi ---
-if isfield(tp, 'Format_UndersampleMajority')
+if exist('tp','var') && isfield(tp, 'Format_UndersampleMajority')
     us = tp.Format_UndersampleMajority;
 
     if us >= 1 || us == 1
@@ -317,14 +348,15 @@ fprintf('\n');
 fprintf('Processing ROIs, please wait... \n')
 fprintf('\n');
 
+nBoundsApplied = 0;
+nBoundsMissing = 0;
+
 for i = 1:numel(rois_sel)
     emptyFrame = [];
     lab        = [];
     ridx       = rois_sel(i);
 
-     progressBar(i, numel(rois_sel), ['Processing ROI: ' cltmp(ridx).id]);
-
-   % disp(['Launching ROI :' num2str(ridx) ' processing...'])
+    progressBar(i, numel(rois_sel), ['Processing ROI: ' cltmp(ridx).id]);
 
     % Charger les images + data si nécessaire
     if numel(cltmp(ridx).image)==0 || numel(cltmp(ridx).data)==0
@@ -337,10 +369,7 @@ for i = 1:numel(rois_sel)
         continue;
     end
 
-    % Channel index
-        % --------- Channel index : indices de sous-canaux propres ---------
-    % channel = classif.channelName (déjà défini plus haut)
-
+    % --------- Channel index : indices de sous-canaux propres ---------
     chanNames = channel;    % alias plus lisible
     pixList   = [];
 
@@ -372,11 +401,9 @@ for i = 1:numel(rois_sel)
     % On garde ce nom pour la suite (appel à preProcessROIData)
     pix = pixList;
 
-
     % Image brute uniquement pour récupérer le nombre de frames (T)
     im        = cltmp(ridx).image(:,:,pix,:);
     roiSeries = cltmp(ridx).data;
-
 
     if isempty(roiSeries)
         disp('No training data available for this position');
@@ -392,23 +419,12 @@ for i = 1:numel(rois_sel)
         continue
     end
 
-    % --- Bounds depuis userData ---
-    bounds = [];
-    ud = [];
-    try
-        ud = roiSeriesSel(1).userData;
-    catch
-        ud = [];
-    end
-    if isstruct(ud) && isfield(ud,'bounds')
-        bounds = ud.bounds;
-    elseif isa(ud,'containers.Map') && isKey(ud,'bounds')
-        bounds = ud('bounds');
-    end
-    if ~isempty(bounds)
-        if numel(bounds)==1 || bounds(1)==0
-            bounds = [];
-        end
+    % --- Bounds selon mode classif.bounds.Type (Auto / Manual / Rules) ---
+    bounds = resolveROIFrameBounds(roiSeriesSel, classif);
+    if isempty(bounds)
+        nBoundsMissing = nBoundsMissing + 1;
+    else
+        nBoundsApplied = nBoundsApplied + 1;
     end
 
     % --- Frames pour cette ROI ---
@@ -463,10 +479,6 @@ for i = 1:numel(rois_sel)
 
         fracKeep = UndersampleMajority;
 
-        %fprintf('CNN undersampling (%.2f) for ROI %s ; majority classes: %s\n', ...
-        %    fracKeep, cltmp(ridx).id, ...
-        %    strjoin(classif.classes(majorityClassesGlobal), ', '));
-
         for c = majorityClassesGlobal(:)'
             frames_c = find(dataidfra == c);
             if numel(frames_c) > 1
@@ -482,30 +494,38 @@ for i = 1:numel(rois_sel)
                 keepIdxCNN(drop_mask & dataidfra == c) = false;
             end
         end
-        % NB : on ne met PAS de garde-fou ici : une classe peut être
-        % absente du dataset CNN pour ce ROI, mais elle reste présente
-        % dans la timeseries LSTM (deep/vid/lab).
     end
 
-    % =======================
+    % =======================           
     %  LSTM Classification
     % =======================
     if strcmp(category,'LSTM')
-        pixb = numel(dataidfra);
-        pixa = find(dataidfra==0);
+        isSeq2Seq = strcmp(classif.trainingParam.classifier_output{end}, 'sequence-to-sequence');
 
-        if numel(pixa)>0 || (numel(pixa)==0 && pixb==0)
-            if strcmp(classif.trainingParam.classifier_output{end},'sequence-to-sequence')
-                disp('Error: some images are not labeled in this ROI - LSTM requires all images to be labeled in the timeseries!');
-            else
-                disp('Error: no images are labeled : sequence-to-one LSTM requires some images to be labeled in the timeseries!');
-            end
-            continue
-        end
+isSeq2Seq = strcmp(classif.trainingParam.classifier_output{end}, 'sequence-to-sequence');
+
+if isSeq2Seq
+    % seq-to-seq : toutes les frames doivent être annotées
+    if any(dataidfra == 0)
+        disp('Error: some images are not labeled in this ROI - seq-to-seq requires all frames labeled.');
+        continue
+    end
+else
+    % seq-to-one : on autorise des trous, MAIS on impose un label ROI
+    if all(dataidfra == 0)
+        disp('Error: no labeled frames in this ROI - seq-to-one needs at least one label.');
+        continue
+    end
+
+    % IMPORTANT : la dernière frame de la séquence doit porter le label ROI
+    if dataidfra(end) == 0
+        disp('Error: last frame is not labeled - seq-to-one expects ROI label on the last frame.');
+        continue
+    end
+end
 
         lab = categorical(dataidfra, 1:numClasses, classif.classes);
 
-        %reverseStr = '';
         cc = 1;
 
         % Taille cible CNN (GoogLeNet, ResNet, ...)
@@ -518,12 +538,6 @@ for i = 1:numel(rois_sel)
             disp('Pre-processing failed, likely because the image is void !');
             continue;
         end
-
-        % if size(imtest,3)==1, imtest = repmat(imtest,[1 1 3]); end
-        % 
-        % if Crop
-        %     imtest = localCrop(imtest, CropCenter, CropSize);
-        % end
 
         H0 = targetH;
         W0 = targetW;
@@ -557,18 +571,23 @@ for i = 1:numel(rois_sel)
                 tmp = imresize(tmp, [H0 W0]);
             end
 
+            % Conversion une fois pour toutes pour LSTM + HDF5
+            frameU8 = uint8(256 * tmp);
+
             % Stockage pour LSTM (timeseries complète)
-            vid(:,:,:,kf) = uint8(256 * tmp);
+            vid(:,:,:,kf) = frameU8;
 
             % Label de la frame pour CNN
-            if classif.output==0
-                cmp = dataid(j);  % sequence-to-sequence
-            else
-                cmp = dataid;     % sequence-to-one (code historique)
-            end
+            % if classif.output==0
+            %     cmp = dataid(j);  % sequence-to-sequence
+            % else
+            %     cmp = dataid;     % sequence-to-one (code historique)
+            % end
+            % CNN dataset : TOUJOURS supervision par frame
+            cmp = dataid(j);
+
 
             % Export TIFF pour CNN (undersamplé via keepIdxCNN)
-
             if  ~UseHDF5 && WriteTiffImages && keepIdxCNN(kf) && cmp ~= 0
                 tr = num2str(j);
                 while numel(tr)<4, tr = ['0' tr]; end
@@ -582,55 +601,67 @@ for i = 1:numel(rois_sel)
 
             % Export HDF5 framebank pour CNN (undersamplé via keepIdxCNN)
             if UseHDF5 && keepIdxCNN(kf) && cmp ~= 0
+                % Création des datasets extensibles une seule fois
                 if ~h5Initialized
-                    % Création des datasets extensibles
-                    h5create(h5Framebank, '/frames', [H0 W0 3 Inf], ...
+                    H0_global = H0;
+                    W0_global = W0;
+
+                    h5create(h5Framebank, '/frames', [H0_global W0_global 3 Inf], ...
                         Datatype="uint8", ...
-                        ChunkSize=[H0 W0 3 1], ...
-                        Deflate=1);
+                        ChunkSize=[H0_global W0_global 3 HDF5BatchSize]);  % plus de Deflate
 
                     h5create(h5Framebank, '/labels', [1 Inf], ...
                         Datatype="int32", ...
-                        ChunkSize=[1 max(128,1)], ...
-                        Deflate=1);
+                        ChunkSize=[1 max(128,HDF5BatchSize)]);
 
                     classNames = string(classif.classes(:))';
                     h5create(h5Framebank, '/classNames', size(classNames), Datatype="string");
                     h5write(h5Framebank, '/classNames', classNames);
 
+                    % buffers pour écriture par paquets
+                    frameBuffer = zeros(H0_global, W0_global, 3, HDF5BatchSize, 'uint8');
+                    labelBuffer = zeros(1, HDF5BatchSize, 'int32');
+                    bufCount    = 0;
+
                     h5Initialized = true;
                 else
-                    info = h5info(h5Framebank, '/frames');
-                    sz = info.Dataspace.Size;
-                    if sz(1)~=H0 || sz(2)~=W0
+                    % sécurité : toutes les frames CNN doivent avoir la même taille
+                    if H0 ~= H0_global || W0 ~= W0_global
                         error('HDF5 framebank size mismatch: expected [%d %d], found [%d %d].', ...
-                            H0, W0, sz(1), sz(2));
+                            H0_global, W0_global, H0, W0);
                     end
                 end
 
-                % Écriture d'une seule frame CNN
-                h5write(h5Framebank, '/frames', uint8(256 * tmp), ...
-                    [1 1 1 nextFrameIdx], [H0 W0 3 1]);
-
-                labVal = int32(cmp);
-                h5write(h5Framebank, '/labels', labVal, ...
-                    [1 nextFrameIdx], [1 1]);
-
+                % Enregistrer l'index de début de cette ROI dans le framebank (index "logique")
                 if isempty(firstIdxROI_CNN)
-                    firstIdxROI_CNN = nextFrameIdx;
+                    firstIdxROI_CNN = nextFrameIdx + bufCount;
                 end
-                nextFrameIdx   = nextFrameIdx + 1;
-                nFramesROI_CNN = nFramesROI_CNN + 1;
 
-                output = output + 1;
+                % Ajouter la frame au buffer
+                bufCount = bufCount + 1;
+                frameBuffer(:,:,:,bufCount) = frameU8;
+                labelBuffer(bufCount)       = int32(cmp);
+
+                nFramesROI_CNN = nFramesROI_CNN + 1;
+                output         = output + 1;
+
+                % Si le buffer est plein, on écrit un bloc d'un coup
+                if bufCount == HDF5BatchSize
+                    h5write(h5Framebank, '/frames', frameBuffer, ...
+                        [1 1 1 nextFrameIdx], [H0_global W0_global 3 bufCount]);
+
+                    h5write(h5Framebank, '/labels', labelBuffer, ...
+                        [1 nextFrameIdx], [1 bufCount]);
+
+                    nextFrameIdx = nextFrameIdx + bufCount;
+                    bufCount     = 0;
+                end
             end
 
-           % msg = sprintf('Processing frame: %d / %d for ROI %s', ...
-            %    kf, numel(fra), cltmp(ridx).id);
-           % fprintf([reverseStr, msg]);
-            %reverseStr = repmat(sprintf('\b'), 1, length(msg));
             cc = cc + 1;
         end
+
+
 
         % Métadonnées de séries CNN (optionnel)
         if UseHDF5 && nFramesROI_CNN > 0 && ~isempty(firstIdxROI_CNN)
@@ -639,6 +670,77 @@ for i = 1:numel(rois_sel)
             seriesIds(end+1,1)   = string(cltmp(ridx).id); %#ok<AGROW>
         end
     end
+
+% ===========================
+%  POST: Seq2One fenêtré
+% ===========================
+if strcmp(category,'LSTM') && ~isSeq2Seq && isempty(emptyFrame)
+
+    % Fenêtres contiguës non chevauchantes de longueur L (dernière fenêtre partielle gardée)
+    nF = numel(fra);
+    if isinf(L) || L >= nF
+    starts = 1;        % une seule fenêtre
+else
+    starts = 1:L:nF;   % fenêtres contiguës
+end
+
+
+    winCountSaved = 0;
+
+    for ws = starts
+        we = min(nF, ws + L - 1);
+        winIdx = ws:we;
+
+        % labels de la fenêtre (dans l'espace 'fra' => dataidfra)
+        winLab = dataidfra(winIdx);
+
+        % ignorer les frames non annotées
+        winLabNZ = winLab(winLab > 0);
+
+        % si aucune annotation dans la fenêtre -> on skip
+        if isempty(winLabNZ)
+            continue
+        end
+
+        % label majoritaire (mode). Tie-break simple: si égalité, prendre le dernier label annoté de la fenêtre.
+        u = unique(winLabNZ);
+        counts = zeros(size(u));
+        for uu = 1:numel(u)
+            counts(uu) = nnz(winLabNZ == u(uu));
+        end
+        maxc = max(counts);
+        cand = u(counts == maxc);
+
+        if numel(cand) == 1
+            winLabelIdx = cand;
+        else
+            % tie-break: dernier label annoté de la fenêtre
+            lastLab = winLabNZ(end);
+            if any(cand == lastLab)
+                winLabelIdx = lastLab;
+            else
+                winLabelIdx = cand(1); % fallback stable
+            end
+        end
+
+        % construire sample fenêtre
+        vid_win  = vid(:,:,:,winIdx);
+        deep_win = winLab; % labels par frame (avec 0 possibles), pour debug/analyses
+        lab_win  = categorical(winLabelIdx, 1:numClasses, classif.classes); % scalaire
+
+        % sauvegarde (un fichier par fenêtre)
+        if ~UseHDF5
+            winCountSaved = winCountSaved + 1;
+            fname = sprintf('lstm_seq2one_%s_w%04d.mat', cltmp(ridx).id, winCountSaved);
+            parsave(fullfile(classif.path, foldername, 'timeseries', fname), deep_win, vid_win, lab_win);
+        end
+    end
+
+    % Important: en seq2one fenêtré, on ne veut PAS sauver le gros fichier ROI complet plus bas.
+end
+
+
+
 
     % =======================
     %  LSTM Regression
@@ -684,23 +786,47 @@ for i = 1:numel(rois_sel)
         output = output + 1;
     end
 
-   % fprintf('\n');
-
     % --------- Sauvegarde timeseries LSTM (pas undersamplée) ---------
-    deep = dataidfra ; % étiquette par frame, dans l'ordre temporel
+  % --------- Sauvegarde timeseries LSTM (pas undersamplée) ---------
+% seq2seq : 1 fichier par ROI (comme avant)
+% seq2one fenêtré : déjà sauvé plus haut (1 fichier par fenêtre)
 
-    if isempty(emptyFrame)
-        if ~UseHDF5
-        parsave(fullfile(classif.path, foldername, 'timeseries', ...
-            ['lstm_labeled_' cltmp(ridx).id '.mat']), deep, vid, lab);
+deep = dataidfra;
+
+if isempty(emptyFrame)
+    if ~UseHDF5
+        if isSeq2Seq
+            parsave(fullfile(classif.path, foldername, 'timeseries', ...
+                ['lstm_labeled_' cltmp(ridx).id '.mat']), deep, vid, lab);
+        else
+            % seq2one fenêtré : ne rien faire ici
         end
-       % cltmp(ridx).save;
-    else
-        disp('This ROI was not saved because it has empty frames');
     end
-
-   % disp(['Processing ROI: ' num2str(ridx) ' ... Done !'])
+else
+    disp('This ROI was not saved because it has empty frames');
 end
+
+end
+
+% Flush final du buffer HDF5 s'il reste des frames non écrites
+if strcmpi(boundsMode,'auto') && isempty(boundsGlobal)
+    disp('[BOUNDS][END] Summary: no specific bounds configured (all selected frames processed, before label filtering).');
+else
+    disp(sprintf('[BOUNDS][END] Summary: specific bounds applied on %d/%d ROI(s); %d ROI(s) had no usable bounds.', ...
+        nBoundsApplied, numel(rois_sel), nBoundsMissing));
+end
+
+if UseHDF5 && h5Initialized && bufCount > 0
+    h5write(h5Framebank, '/frames', frameBuffer(:,:,:,1:bufCount), ...
+        [1 1 1 nextFrameIdx], [H0_global W0_global 3 bufCount]);
+
+    h5write(h5Framebank, '/labels', labelBuffer(1:bufCount), ...
+        [1 nextFrameIdx], [1 bufCount]);
+
+    nextFrameIdx = nextFrameIdx + bufCount;
+    bufCount     = 0;
+end
+
 
 % Finalisation du framebank HDF5 (métadonnées CNN séries)
 if UseHDF5 && h5Initialized
@@ -758,5 +884,194 @@ if any([padL padR padT padB] > 0)
 end
 
 x1p = x1 + padL; x2p = x2 + padL;
-y1p = y1 + padT; y2p = y2 + padT + (ch-1);
+y1p = y1 + padT; y2p = y1 + padT + (ch-1);
 out = in(y1p:y2p, x1p:x2p, :);
+
+function bounds = resolveROIFrameBounds(roiSeriesSel, classif)
+% Resolve frame bounds for one ROI according to classif.bounds.Type:
+%   Auto   -> use classif.bounds.Values as global bounds (if provided),
+%             otherwise no bounds filtering (all frames)
+%   Manual -> prefer userbounds, fallback to bounds
+%   Rules  -> use bounds (rule-computed values, if any)
+
+mode = "Manual";
+globalBounds = readGlobalBoundsFromClassif(classif);
+try
+    if isprop(classif,'bounds') && isstruct(classif.bounds) && isfield(classif.bounds,'Type')
+        mode = string(classif.bounds.Type);
+    end
+catch
+    mode = "Manual";
+end
+
+ud = [];
+try
+    ud = roiSeriesSel(1).userData;
+catch
+    ud = [];
+end
+
+switch lower(mode)
+    case "auto"
+        bounds = globalBounds;
+    case "manual"
+        bounds = readBoundsField(ud, 'userbounds');
+        if isempty(bounds)
+            bounds = readBoundsField(ud, 'bounds');
+        end
+    case "rules"
+        bounds = readBoundsField(ud, 'bounds');
+    otherwise
+        bounds = readBoundsField(ud, 'bounds');
+end
+
+bounds = sanitizeBounds(bounds);
+
+function val = readGlobalBoundsFromClassif(classif)
+val = [];
+
+try
+    if ~(isprop(classif,'bounds') && isstruct(classif.bounds) && isfield(classif.bounds,'Values'))
+        return;
+    end
+    raw = classif.bounds.Values;
+catch
+    return;
+end
+
+if isempty(raw)
+    return;
+end
+
+if isnumeric(raw)
+    val = raw;
+    return;
+end
+
+if iscell(raw)
+    raw = raw{1};
+end
+
+if isstring(raw) || ischar(raw)
+    txt = char(string(raw));
+    nums = regexp(txt, '[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', 'match');
+    if numel(nums) >= 2
+        val = [str2double(nums{1}) str2double(nums{2})];
+    end
+end
+
+function val = readBoundsField(ud, fieldName)
+val = [];
+if isstruct(ud) && isfield(ud, fieldName)
+    val = ud.(fieldName);
+elseif isa(ud,'containers.Map') && isKey(ud, fieldName)
+    val = ud(fieldName);
+end
+
+function bounds = sanitizeBounds(bounds)
+if isempty(bounds)
+    return;
+end
+
+bounds = double(bounds(:)');
+if numel(bounds) < 2 || ~all(isfinite(bounds(1:2)))
+    bounds = [];
+    return;
+end
+
+bounds = round(bounds(1:2));
+
+% Legacy convention: first bound = 0 means "no bounds".
+if bounds(1) == 0
+    bounds = [];
+    return;
+end
+
+if bounds(2) ~= 0 && bounds(2) < bounds(1)
+    bounds = [bounds(2) bounds(1)];
+end
+
+function [boundsType, globalBounds] = localGetBoundsPolicy(classif)
+boundsType = "Auto";
+globalBounds = [];
+
+if ~(isprop(classif,'bounds') && isstruct(classif.bounds))
+    return;
+end
+
+if isfield(classif.bounds,'Type') && ~isempty(classif.bounds.Type)
+    boundsType = string(classif.bounds.Type);
+end
+
+if isfield(classif.bounds,'Values')
+    globalBounds = localNormalizeBounds(classif.bounds.Values);
+end
+
+function bounds = localNormalizeBounds(raw)
+bounds = [];
+
+if isempty(raw)
+    return;
+end
+
+if iscell(raw)
+    raw = raw{1};
+end
+
+if ischar(raw) || isstring(raw)
+    nums = regexp(char(string(raw)), '[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', 'match');
+    if numel(nums) < 2
+        return;
+    end
+    raw = [str2double(nums{1}) str2double(nums{2})];
+end
+
+if ~isnumeric(raw)
+    return;
+end
+
+raw = double(raw(:)');
+if numel(raw) < 2 || any(~isfinite(raw(1:2)))
+    return;
+end
+
+bounds = round(raw(1:2));
+if bounds(1) == 0
+    bounds = [];
+    return;
+end
+
+if bounds(2) ~= 0 && bounds(2) < bounds(1)
+    bounds = bounds([2 1]);
+end
+
+% =========================================================================
+% === Helpers pour gestion robuste du framebank CNN =======================
+% =========================================================================
+function tf = tryDeleteSafe(fpath)
+% Essaye de supprimer 'fpath' et vérifie qu'il a vraiment disparu.
+% Renvoie true si supprimé ou absent, false si encore présent.
+tf = false;
+if ~exist(fpath, 'file')
+    tf = true;    % déjà absent
+    return;
+end
+
+try
+    delete(fpath);
+catch
+    % delete() a échoué -> fichier suspect/locké
+    return;
+end
+
+% Attente brève (filesystem / cache / NFS)
+for kk = 1:20
+    pause(0.05); % 50 ms
+    if ~exist(fpath, 'file')
+        tf = true;
+        return;
+    end
+end
+
+% Toujours présent -> fichier vérolé / fantôme
+tf = false;

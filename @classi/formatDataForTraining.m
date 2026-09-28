@@ -97,11 +97,15 @@ function output = formatDataForTraining(classif, varargin)
         mkdir(classif.path, foldername);
     end
 
+
     % ---- ROIs d'entraînement / validation ----
     if numel(rois) == 0
         rois = classif.trainingset;
     end
     valrois = setxor(1:numel(classif.roi), rois);
+
+   
+
 
     % ---- Dispatch par catégorie ----
     switch category
@@ -111,16 +115,16 @@ function output = formatDataForTraining(classif, varargin)
             output = formatImageTrainingSet(foldername, classif, rois);
 
         case 'LSTM'
-            % On construit d'abord la liste d'arguments de base
-            baseArgs = {'Fraction', Fraction, 'Seed', Seed};
+            % Construire la liste d'arguments de base pour LSTM.
+            % (Frames est géré explicitement dans formatLSTMTrainingSet.)
+            baseArgs = {};
             if ~isempty(Frames)
                 baseArgs = [baseArgs, {'Frames', Frames}];
             end
 
             % NEW: on ajoute tous les extraArgs (UndersampleMajority, Crop, ...)
             output = formatLSTMTrainingSet( ...
-                        foldername, classif, rois, ...
-                        baseArgs{:}, extraArgs{:});
+                        foldername, classif, rois, baseArgs{:}, extraArgs{:});
 
         case 'Pixel'
             if isprop(classif, 'description')

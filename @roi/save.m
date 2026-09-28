@@ -39,7 +39,7 @@ end
 h5File    = fullfile(obj.path, ['im_'   obj.id '.h5']);
 h5BakFile = fullfile(obj.path, ['im_'   obj.id '.bak']);   %%% ATOMIC WRITE (backup)
 dataFile  = fullfile(obj.path, ['data_' obj.id '.mat']);
-dataBak   = fullfile(obj.path, ['data_' obj.id '.bak']);   %%% ATOMIC WRITE (backup)
+dataBak   = fullfile(obj.path, ['data_' obj.id '.bak']);   %%% persistent one-step-behind backup
 
 % ---------- Interpret 'option' ----------
 onlyData = (ischar(option)   && strcmp(option,'data')) || ...
@@ -222,16 +222,36 @@ while ~success && attempts < max_attempts
 
         %%% ATOMIC WRITE for data .mat
         tmpUuidD = char(java.util.UUID.randomUUID);
-        dataTmp  = [dataFile '.tmp.' tmpUuidD];
+        dataTmp  = [dataFile '.tmp.' tmpUuidD '.mat'];
+
         save(dataTmp, 'data', '-v7.3');
 
-        if ~localVerifyMat(dataTmp)
-            if exist(dataTmp,'file'); delete(dataTmp); end
-            error('roi:save:verifyMAT','Temporary MAT verification failed.');
+        for k = 1:5
+    [ok, ME] = localVerifyMat(dataTmp);
+    if ok, break; end
+    pause(0.2);
         end
+        
+if ~ok
+    if exist(dataTmp,'file')
+        d = dir(dataTmp);
+        warning('MAT tmp: %s (bytes=%d, date=%s)', dataTmp, d.bytes, d.date);
+    else
+        warning('MAT tmp does not exist: %s', dataTmp);
+    end
+    if ~isempty(ME)
+        disp(getReport(ME,'extended'));
+    end
+    if exist(dataTmp,'file'); delete(dataTmp); end
+    error('roi:save:verifyMAT','Temporary MAT verification failed.');
+end
+
 
         if exist(dataFile,'file')
             copyfile(dataFile, dataBak, 'f');
+        elseif exist(dataBak,'file')
+            % No current MAT means there is no valid "previous version" to keep.
+            delete(dataBak);
         end
         if exist(dataFile,'file'), delete(dataFile); end
         movefile(dataTmp, dataFile, 'f');
@@ -269,14 +289,9 @@ while ~success && attempts < max_attempts
     % end
 end
 
-% Si tout s'est bien passé, on nettoie les backups .bak
-if success
-    if exist(h5BakFile,'file')
-        delete(h5BakFile);
-    end
-    if exist(dataBak,'file')
-        delete(dataBak);
-    end
+% Keep only the MAT backup as persistent one-step-behind.
+if success && exist(h5BakFile,'file')
+    delete(h5BakFile);
 end
 
 
@@ -406,23 +421,23 @@ end
 dispMeta.num_subchannels = k;
 end
 
-function nameOut = sanitizeDatasetName(nameIn)
-s = char(string(nameIn));
-s = regexprep(s,'\s+','_');
-s = regexprep(s,'[^A-Za-z0-9_\-\.]','_');
-if isempty(s), s = 'channel'; end
-nameOut = s;
-end
 
-function ok = localVerifyMat(matPath)     %%% ATOMIC WRITE helper
-ok = false;
+function [ok, ME] = localVerifyMat(matPath)
+ok = false; ME = [];
 try
+    if ~exist(matPath,'file')
+        error('roi:save:matMissing','File not found: %s', matPath);
+    end
     vars = whos('-file', matPath);
     ok   = ~isempty(vars);
-catch
+    if ~ok
+        error('roi:save:matEmpty','No variables found in MAT: %s', matPath);
+    end
+catch ME
     ok = false;
 end
 end
+
 
 function ok = localVerifyH5(h5Path)       %%% ATOMIC WRITE helper
 ok = false;
